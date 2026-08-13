@@ -8,12 +8,17 @@ VERSION file format (repo root):
 RELEASES file format (repo root), one record per line:
   <semver> <YYYY-MM-DD> <ontology|doc-only>
 
-Ontology TTL stamping (docs/**/*.ttl):
-  Only files that already declare owl:versionInfo are updated.
-  dcterms:modified / owl:versionIRI / owl:priorVersion are updated only when present
-  (priorVersion may also be inserted after versionIRI when a prior release exists).
-  Ontology namespace for versionIRI is derived per file from vann:preferredNamespaceUri,
-  falling back to the owl:Ontology IRI.
+Ontology TTL stamping (docs/**/*.ttl) on ontology releases:
+  * Main ontology files (declare owl:versionInfo): always ensure versionInfo,
+    versionIRI, and dcterms:modified (insert if missing). priorVersion is
+    ensured when a prior ontology release exists; removed when it does not.
+    Full releases point priorVersion at the latest prior *full* release;
+    pre-releases point at the immediately prior ontology SemVer.
+  * Component files (no owl:versionInfo): if the file is new or changed since
+    the previous ontology git tag, update dcterms:modified or insert it.
+    Unchanged existing files without dcterms:modified are left alone.
+  Ontology namespace for versionIRI is derived per file from
+  vann:preferredNamespaceUri, owl:Ontology IRI, BASE, or PREFIX :.
 """
 
 from __future__ import annotations
@@ -22,11 +27,12 @@ import argparse
 import datetime as dt
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from functools import total_ordering
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 def _repo_root() -> Path:
     """Ontology repository root (VERSION, RELEASES, docs/).
@@ -318,12 +324,18 @@ def latest_ontology_version(records: Iterable[ReleaseRecord]) -> Optional[str]:
     return best_text
 
 
-def prior_version_for(records: list[ReleaseRecord]) -> Optional[str]:
-    """Prefer last full ontology release; else last ontology release (pre-release OK)."""
-    full = latest_full_ontology_version(records)
-    if full:
-        return full
-    return latest_ontology_version(records)
+def prior_version_for(
+    records: list[ReleaseRecord], *, for_prerelease: bool
+) -> Optional[str]:
+    """Choose owl:priorVersion target for the release being stamped.
+
+    Pre-releases reference the immediately prior ontology SemVer (full or pre).
+    Full releases reference the latest prior *full* ontology release only, so
+    retired pre-release tags are not left as priorVersion.
+    """
+    if for_prerelease:
+        return latest_ontology_version(records)
+    return latest_full_ontology_version(records)
 
 
 def max_release_date(records: Iterable[ReleaseRecord]) -> Optional[dt.date]:
@@ -405,7 +417,111 @@ def _field_terminator_after(text: str, field: str) -> str:
     return m.group(1) if m else ";"
 
 
-def _replace_ttl_metadata(
+def _ttl_label(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _sub_ttl_field(
+    text: str, field: str, new_value: str, term: Optional[str] = None
+) -> str:
+    terminator = term if term is not None else _field_terminator_after(text, field)
+    pattern = rf"^(\s*{re.escape(field)}\s+)\S+.*$"
+    replacement = rf"\1{new_value} {terminator}"
+    new_body, n = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+    if n != 1:
+        raise ValueError(f"Expected one match for field {field}")
+    return new_body
+
+
+def _insert_ttl_field_after(
+    text: str, field: str, new_value: str, after_field: str
+) -> str:
+    """Insert field after after_field; after_field keeps ';' and new field takes old terminator."""
+    term = _field_terminator_after(text, after_field)
+    padded = f"{field:<30}"
+    pattern = rf"^(\s*{re.escape(after_field)}\s+\S+.*?)\s*[;.]\s*$"
+    new_text, n = re.subn(
+        pattern,
+        rf"\1 ;\n    {padded} {new_value} {term}",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if n != 1:
+        raise ValueError(f"Could not insert {field} after {after_field}")
+    return new_text
+
+
+def _upsert_ttl_field(
+    text: str, field: str, new_value: str, *, after_field: str
+) -> str:
+    if _has_ttl_field(text, field):
+        return _sub_ttl_field(text, field, new_value)
+    return _insert_ttl_field_after(text, field, new_value, after_field)
+
+
+def _remove_ttl_field(text: str, field: str) -> str:
+    """Remove a predicate line; if it ended the block with '.', give '.' to a prior field."""
+    m = re.search(
+        rf"^\s*{re.escape(field)}\s+\S+.*?([;.])\s*$",
+        text,
+        flags=re.MULTILINE,
+    )
+    if not m:
+        return text
+    term = m.group(1)
+    start, end = m.start(), m.end()
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    elif start > 0 and text[start - 1] == "\n":
+        start -= 1
+    text = text[:start] + text[end:]
+    if term == ".":
+        for prev in ("owl:versionIRI", "owl:versionInfo", "dcterms:modified"):
+            if _has_ttl_field(text, prev):
+                text = re.sub(
+                    rf"^(\s*{re.escape(prev)}\s+\S+.*?)\s*[;.]\s*$",
+                    r"\1 .",
+                    text,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                break
+    return text
+
+
+def _ensure_modified_date(text: str, modified: str) -> str:
+    """Update dcterms:modified, or insert it after the owl:Ontology declaration."""
+    value = f'"{modified}"^^xsd:date'
+    if _has_ttl_field(text, "dcterms:modified"):
+        return _sub_ttl_field(text, "dcterms:modified", value)
+
+    pattern = r"^(\s*.*?\b(?:a|rdf:type)\s+owl:Ontology)\s*([;.])\s*$"
+    m = re.search(pattern, text, flags=re.MULTILINE)
+    if m:
+        old_term = m.group(2)
+        new_line = (
+            f"{m.group(1)} ;\n"
+            f"    dcterms:modified               {value} {old_term}"
+        )
+        return text[: m.start()] + new_line + text[m.end() :]
+
+    # Main ontologies always have versionInfo; insert immediately before it.
+    m = re.search(r"^(\s*)owl:versionInfo\s+", text, flags=re.MULTILINE)
+    if m:
+        insertion = f"{m.group(1)}dcterms:modified               {value} ;\n"
+        return text[: m.start()] + insertion + text[m.start() :]
+
+    raise ValueError(
+        "Cannot insert dcterms:modified: no owl:Ontology declaration "
+        "or owl:versionInfo found"
+    )
+
+
+def _ensure_main_ontology_metadata(
     text: str,
     *,
     modified: str,
@@ -413,62 +529,81 @@ def _replace_ttl_metadata(
     prior: Optional[str],
     ontology_ns: str,
 ) -> str:
-    """Update version metadata fields that are already present in the TTL.
+    """Ensure main-ontology version metadata fields are present and current.
 
-    owl:versionInfo is required (caller must ensure it exists). dcterms:modified and
-    owl:versionIRI are updated only when already declared. owl:priorVersion is updated
-    when present, or inserted after owl:versionIRI when a prior release exists.
+    Always writes versionInfo, versionIRI, and dcterms:modified. Writes
+    priorVersion only when a prior release exists (removes a stale one otherwise).
     """
     if not _has_ttl_field(text, "owl:versionInfo"):
         raise ValueError("Expected owl:versionInfo in TTL")
 
     ver = normalize_semver(version)
     iri = version_iri(ver, ontology_ns)
-    has_modified = _has_ttl_field(text, "dcterms:modified")
-    has_version_iri = _has_ttl_field(text, "owl:versionIRI")
-    has_prior = _has_ttl_field(text, "owl:priorVersion")
 
-    def sub_field(field: str, new_value: str, body: str, term: Optional[str] = None) -> str:
-        terminator = term if term is not None else _field_terminator_after(body, field)
-        pattern = rf"^(\s*{re.escape(field)}\s+)\S+.*$"
-        replacement = rf"\1{new_value} {terminator}"
-        new_body, n = re.subn(pattern, replacement, body, count=1, flags=re.MULTILINE)
-        if n != 1:
-            raise ValueError(f"Expected one match for field {field}")
-        return new_body
+    text = _ensure_modified_date(text, modified)
+    text = _sub_ttl_field(text, "owl:versionInfo", f'"{ver}"')
+    text = _upsert_ttl_field(
+        text, "owl:versionIRI", f"<{iri}>", after_field="owl:versionInfo"
+    )
 
-    if has_modified:
-        text = sub_field("dcterms:modified", f'"{modified}"^^xsd:date', text)
-    text = sub_field("owl:versionInfo", f'"{ver}"', text)
-    if has_version_iri:
-        text = sub_field("owl:versionIRI", f"<{iri}>", text)
-
-    if has_prior:
-        if prior:
-            text = sub_field(
-                "owl:priorVersion", f"<{version_iri(prior, ontology_ns)}>", text
-            )
-        else:
-            text = re.sub(
-                r"^\s*owl:priorVersion\s+\S+.*\n",
-                "",
-                text,
-                count=1,
-                flags=re.MULTILINE,
-            )
-    elif prior and has_version_iri:
-        # Insert priorVersion after versionIRI, using the terminator versionIRI had
-        # (versionIRI becomes ';' and priorVersion takes the old terminator).
-        term = _field_terminator_after(text, "owl:versionIRI")
-        text = re.sub(
-            r"^(\s*owl:versionIRI\s+<[^>]+>)\s*[;.]\s*$",
-            rf"\1 ;\n    owl:priorVersion               "
-            rf"<{version_iri(prior, ontology_ns)}> {term}",
+    if prior:
+        text = _upsert_ttl_field(
             text,
-            count=1,
-            flags=re.MULTILINE,
+            "owl:priorVersion",
+            f"<{version_iri(prior, ontology_ns)}>",
+            after_field="owl:versionIRI",
         )
+    else:
+        text = _remove_ttl_field(text, "owl:priorVersion")
     return text
+
+
+def ttl_paths_changed_since(prior_tag: Optional[str]) -> Set[Path]:
+    """docs/**/*.ttl whose tree content differs from prior_tag (or all, if none).
+
+    Includes newly added files. When there is no prior tag, every TTL is treated
+    as new/changed.
+    """
+    all_ttl = discover_ttl_files()
+    if not prior_tag:
+        return set(all_ttl)
+
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", prior_tag],
+        cwd=ROOT,
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        print(
+            f"Prior tag {prior_tag} not found; treating all docs/**/*.ttl as changed"
+        )
+        return set(all_ttl)
+
+    # Compare prior release tree to the working tree (HEAD in CI).
+    result = subprocess.run(
+        ["git", "diff", "--name-only", prior_tag, "--", "docs"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"git diff against {prior_tag} failed; "
+            "treating all docs/**/*.ttl as changed",
+            file=sys.stderr,
+        )
+        print(result.stderr.strip(), file=sys.stderr)
+        return set(all_ttl)
+
+    changed: Set[Path] = set()
+    for line in result.stdout.splitlines():
+        rel = line.strip()
+        if not rel.endswith(".ttl"):
+            continue
+        path = (ROOT / rel).resolve()
+        if path.is_file():
+            changed.add(path)
+    return changed
 
 
 def stamp_ttl(
@@ -478,7 +613,8 @@ def stamp_ttl(
 ) -> list[Path]:
     """Update ontology TTL metadata for an ontology release. No-op for doc-only.
 
-    Scans docs/**/*.ttl and stamps only files that already declare owl:versionInfo.
+    Main ontologies (owl:versionInfo): ensure SemVer + modified metadata.
+    Components (no versionInfo): ensure dcterms:modified when new or changed.
     """
     if vf.is_doc_only:
         return []
@@ -492,48 +628,48 @@ def stamp_ttl(
             and normalize_semver(r.version) == normalize_semver(vf.version)
         )
     ]
-    prior = prior_version_for(prior_records)
+    prior = prior_version_for(prior_records, for_prerelease=vf.is_prerelease)
+    # Change detection uses the immediately prior ontology tag (including
+    # pre-releases), not the priorVersion IRI target.
+    immediate_prior = latest_ontology_version(prior_records)
+    prior_tag = ontology_tag(immediate_prior) if immediate_prior else None
+    changed_since_prior = {p.resolve() for p in ttl_paths_changed_since(prior_tag)}
     modified = today.isoformat()
-    changed: list[Path] = []
+    stamped: list[Path] = []
+
     for path in discover_ttl_files():
         original = path.read_text(encoding="utf-8")
-        if not _has_ttl_field(original, "owl:versionInfo"):
-            try:
-                label = path.relative_to(ROOT)
-            except ValueError:
-                label = path
-            print(f"Skipping {label} (no owl:versionInfo)")
-            continue
-        # Namespace is only needed when building/updating version IRIs.
-        needs_ns = _has_ttl_field(original, "owl:versionIRI") or _has_ttl_field(
-            original, "owl:priorVersion"
-        )
-        ontology_ns = ""
-        if needs_ns:
+        label = _ttl_label(path)
+        is_main = _has_ttl_field(original, "owl:versionInfo")
+
+        if is_main:
             try:
                 ontology_ns = ontology_ns_from_ttl(original)
             except ValueError as e:
-                try:
-                    label = path.relative_to(ROOT)
-                except ValueError:
-                    label = path
                 raise ValueError(f"{label}: {e}") from e
-        updated = _replace_ttl_metadata(
-            original,
-            modified=modified,
-            version=vf.version,
-            prior=prior,
-            ontology_ns=ontology_ns,
-        )
+            updated = _ensure_main_ontology_metadata(
+                original,
+                modified=modified,
+                version=vf.version,
+                prior=prior,
+                ontology_ns=ontology_ns,
+            )
+            action = f"Stamped main ontology {label}"
+        else:
+            if path.resolve() not in changed_since_prior:
+                print(
+                    f"Skipping {label} (component unchanged since "
+                    f"{prior_tag or 'start'})"
+                )
+                continue
+            updated = _ensure_modified_date(original, modified)
+            action = f"Updated modified on component {label}"
+
         if updated != original:
             path.write_text(updated, encoding="utf-8")
-            changed.append(path)
-            try:
-                label = path.relative_to(ROOT)
-            except ValueError:
-                label = path
-            print(f"Stamped {label}")
-    return changed
+            stamped.append(path)
+            print(action)
+    return stamped
 
 
 def append_release(

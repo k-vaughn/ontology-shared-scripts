@@ -18,8 +18,10 @@ name: Apply VERSION and publish release
 #         release_tag: ${{ needs.release.outputs.tag }}
 #       secrets: inherit
 #
-# Stamps docs/**/*.ttl that already have owl:versionInfo, appends RELEASES,
-# commits if needed, and creates a GitHub Release/tag.
+# Stamps main ontology TTL (ensures versionInfo/versionIRI/modified, and
+# priorVersion when a prior release exists). Ensures dcterms:modified on
+# component TTL files that are new or changed since the prior ontology tag.
+# Appends RELEASES, commits if needed, and creates a GitHub Release/tag.
 # Deploy is a separate callable workflow so callers can chain it (nested
 # relative uses: ./ would resolve against the caller repo, not this one).
 
